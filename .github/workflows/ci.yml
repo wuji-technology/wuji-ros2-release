@@ -1,0 +1,138 @@
+name: CI
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  required_files:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check required files
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path('.')
+          required = ('README.md', 'LICENSE', '.ros-release.yaml')
+          missing = [path for path in required if not (root / path).is_file()]
+          if missing:
+              raise SystemExit(f'missing required files: {missing}')
+          PY
+
+  package_metadata:
+    needs: required_files
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check package metadata
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          expected = {
+              'wuji_sdk_vendor', 'wuji_msgs', 'wuji_tools',
+              'wuji_hand2_driver', 'wuji_glove_driver', 'wuji_bringup',
+          }
+          found = set()
+          for manifest in Path('.').glob('*/package.xml'):
+              root = ET.parse(manifest).getroot()
+              name = root.findtext('name')
+              if name not in expected or name in found:
+                  raise SystemExit(f'unexpected or duplicate package: {name}')
+              found.add(name)
+          if found != expected:
+              raise SystemExit(f'package metadata mismatch: {found}')
+          PY
+
+  release_config:
+    needs: package_metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check release configuration
+        run: |
+          python3 -m pip install --disable-pip-version-check --user pyyaml
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          import yaml
+
+          config = yaml.safe_load(Path('.ros-release.yaml').read_text())
+          if not isinstance(config, dict):
+              raise SystemExit('release configuration must be a mapping')
+          if not config.get('ros_distros'):
+              raise SystemExit('release configuration is incomplete')
+          for distro in config['ros_distros']:
+              if not distro.get('name') or not distro.get('container_image'):
+                  raise SystemExit('ROS distro configuration is incomplete')
+          if config.get('release_tag') != 'v:{version}':
+              raise SystemExit('unexpected release tag template')
+          manifests = sorted(Path('.').glob('*/package.xml'))
+          if not manifests:
+              raise SystemExit('no ROS package manifests found')
+          for manifest in manifests:
+              package_name = manifest.parent.name
+              metadata = ET.parse(manifest).getroot()
+              if metadata.findtext('name') != package_name:
+                  raise SystemExit(f'package manifest mismatch: {package_name}')
+              if not metadata.findtext('version'):
+                  raise SystemExit(f'package version is missing: {package_name}')
+          if config['ros_distros'][0].get('name') != 'lyrical':
+              raise SystemExit('unexpected ROS distro')
+          PY
+
+  workflow_contract:
+    needs: release_config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check workflow contract
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import yaml
+
+          workflow = yaml.safe_load(Path('.github/workflows/ci.yml').read_text())
+          events = workflow.get('on', workflow.get(True))
+          if set(events) != {'pull_request'}:
+              raise SystemExit(f'unexpected events: {events}')
+          if workflow.get('permissions') != {'contents': 'read'}:
+              raise SystemExit('CI workflow permissions must be read-only')
+          forbidden_event = 'pull_request_' + 'target'
+          if forbidden_event in str(workflow):
+              raise SystemExit('CI workflow uses a target event')
+          PY
+
+  repository_boundary:
+    needs: workflow_contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check symlink boundaries
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path('.').resolve()
+          for link in root.rglob('*'):
+              if not link.is_symlink():
+                  continue
+              target = link.resolve(strict=True)
+              if root not in (target, *target.parents):
+                  raise SystemExit(f'symlink escapes the repository: {link}')
+          PY

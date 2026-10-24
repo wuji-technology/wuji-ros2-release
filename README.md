@@ -1,120 +1,172 @@
-# wuji_glove_driver
+# wuji-ros2
 
-`wuji_glove_driver` connects one Wuji Glove to ROS2 and publishes its SDK data streams. It is a thin data adapter that preserves SDK timestamps, frame identifiers, and payload values. It doesn't create subscriptions, services, or actions, and it doesn't load a model, publish transforms, expose controls, or provide calibration interfaces.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Release](https://img.shields.io/github/v/release/wuji-technology/wuji-ros2)](https://github.com/wuji-technology/wuji-ros2/releases)
 
-## Run the Node
+Wuji ROS2 packages connect Wuji Hand 2 and Wuji Glove to the ROS graph. The repository provides source-built drivers, public interfaces, launch integration, device listing, and a vendor package that fetches the Wuji SDK C library. The wrapper keeps device-specific behavior small and uses standard ROS messages where practical.
 
-Select a device by serial number:
+## Supported Environment
+
+| Area | Supported |
+|------|-----------|
+| ROS2 | Lyrical |
+| Operating system | Ubuntu Linux |
+| Architecture | x86_64 and aarch64 |
+| Device | Wuji Hand 2 and Wuji Glove |
+| Description | Wuji Hand 2.1 and Wuji Hand 2.2 |
+| Installation | Source build |
+
+## Repository Structure
+
+```text
+├── .github/workflows/              // CI and release workflows
+├── driver_common/                  // Shared internal driver infrastructure
+├── scripts/                        // Description installer and hardware test entry points
+├── test/                           // Repository documentation and hardware-gate tests
+├── wuji_bringup/                   // Launch files, RViz config, and Demos
+├── wuji_glove_driver/              // Wuji Glove ROS2 driver
+├── wuji_hand2_driver/              // Wuji Hand 2 ROS2 driver
+├── wuji_msgs/                      // Wuji ROS messages and services
+├── wuji_sdk_vendor/                // Wuji SDK C vendor package
+├── wuji_tools/                     // Device command-line tools
+├── .clang-format                   // C++ formatting rules
+└── README.md
+```
+
+## Quick Start
+
+### Installation
+
+Clone the repository, install the ROS dependencies, and build the production packages. Run `sudo rosdep init` once if rosdep has never been set up on this machine:
 
 ```bash
-ros2 run wuji_glove_driver wuji_glove_node \
+git clone https://github.com/wuji-technology/wuji-ros2.git
+cd wuji-ros2
+
+source /opt/ros/lyrical/setup.bash
+sudo apt-get update
+sudo apt-get install -y ros-dev-tools
+rosdep update
+scripts/install_hand2_descriptions.sh
+rosdep install --from-paths . --ignore-src -r -y
+
+colcon build --cmake-args -DBUILD_TESTING=OFF
+source install/setup.bash
+```
+
+`scripts/install_hand2_descriptions.sh` installs the Wuji Hand 2 description packages from the ROS 2 testing apt repository until they are available in the main ROS 2 apt repository. The script adds the testing repository only for these two packages and removes it before it exits, so other ROS packages on the machine still come from the main repository.
+
+The build downloads and verifies the Wuji SDK archive for the active architecture. For an offline build, extract a matching Wuji SDK C release and add `-DWUJI_SDK_ROOT=<sdk-root>` to the CMake arguments.
+
+### List Devices
+
+List reachable devices before choosing a selector:
+
+```bash
+ros2 run wuji_tools wuji_list
+```
+
+Use the reported serial number to select one device explicitly.
+
+### Start the Driver
+
+Start one Wuji Hand 2 driver node:
+
+```bash
+ros2 run wuji_hand2_driver wuji_hand2_node \
   --ros-args -p serial_number:=<serial-number>
 ```
 
-You can also use the installed launch file:
+For a URDF, robot state publisher, and optional RViz view, use the bringup launch files instead:
+
+```bash
+ros2 launch wuji_bringup hand2_view.launch.py \
+  serial_number:=<serial-number> hand_side:=<left-or-right> \
+  namespace:=<namespace>
+```
+
+Start one Wuji Glove driver with its data-only launch:
 
 ```bash
 ros2 launch wuji_bringup glove.launch.py \
   serial_number:=<serial-number> namespace:=<namespace>
 ```
 
-All topic names are relative. Use a ROS namespace when running more than one driver.
+When only one Wuji Glove is reachable, all selectors can remain empty. See the [`wuji_glove_driver` guide](wuji_glove_driver/README.md) for its 10 published topics and selection rules.
 
-## Device Selection
+### Demos and Safety
 
-The node applies selectors in this priority order:
+With the view launch running, check the required raw topics and print received-data statistics:
 
-1. `endpoint`
-2. `serial_number`
-3. `hand_side`
-4. Unique Wuji Glove discovery
+```bash
+ros2 run wuji_bringup hand2_status_demo --ros-args \
+  -r __ns:=/<namespace>
+```
 
-An endpoint selects the connection directly. Any supplied serial number or hand side then validates the connected device. When both serial number and hand side are set, the serial number selects the device and the hand side validates it.
+Wuji Hand 2 currently doesn't provide an orientation estimate. The driver marks orientation unavailable with `orientation_covariance[0] = -1`.
 
-With no selector, the node connects only after discovery finds one unique Wuji Glove. It keeps waiting when none are found and fails when multiple candidates are found. Set `serial_number` to disambiguate multiple devices. Selection, connection, identity reads, and retries share the `connect_timeout` deadline.
+Stop the view launch, then start the driver with control enabled before running the wave Demo:
 
-## Parameters
+```bash
+ros2 launch wuji_bringup hand2.launch.py \
+  serial_number:=<serial-number> hand_side:=<left-or-right> \
+  namespace:=<namespace> auto_enable:=true
+```
 
-The node reads these 13 parameters only during startup. `joint_angles` is always enabled and has no publish parameter.
+```bash
+ros2 run wuji_bringup hand2_wave_demo --ros-args \
+  -r __ns:=/<namespace>
+```
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `endpoint` | string | `""` | Wuji SDK address used for direct connection |
-| `serial_number` | string | `""` | Selects a device by serial number |
-| `hand_side` | string | `""` | Selects `left` or `right`. Empty doesn't filter by side |
-| `connect_timeout` | double | `10.0` | Overall timeout in seconds. Set to `0.0` to wait until ROS shutdown |
-| `publish_emf_poses` | bool | `true` | Starts the EMF pose stream |
-| `publish_tip_poses` | bool | `true` | Starts the fingertip pose stream |
-| `publish_skeleton` | bool | `true` | Starts the hand-skeleton stream |
-| `publish_imu` | bool | `true` | Starts the raw palm IMU stream |
-| `publish_tactile` | bool | `true` | Starts the tactile grid stream |
-| `publish_tactile_residual` | bool | `true` | Starts the tactile residual stream |
-| `publish_tactile_binary` | bool | `true` | Starts the tactile binary stream |
-| `publish_tactile_zones` | bool | `true` | Starts the tactile-zone stream |
-| `publish_tactile_points` | bool | `true` | Starts the tactile point-cloud stream |
+> [!CAUTION]
+> Run motion Demos on an unloaded, secured hand with an operator present. Keep people clear of moving parts. The driver doesn't implement a command watchdog, so stop the Demo and then stop the launch process to let the driver disable the hand.
 
-`hand_side` accepts `left`, `right`, or an empty value. `connect_timeout` must be finite and nonnegative.
+Before starting or restarting the wave Demo, confirm that the hand is unloaded and at its zero target. Each start publishes zero targets for 1 second before it begins the wave. See the [`wuji_bringup` guide](wuji_bringup/README.md) for the full launch arguments, Demo behavior, and troubleshooting.
 
-## Topics
-
-All 10 topics use keep-last 5, best-effort, volatile sensor-data QoS. Output rates are device-dependent because the Wuji SDK doesn't specify them.
-
-| Topic | Type | Policy | Enable Parameter |
-|-------|------|--------|------------------|
-| `joint_angles` | `wuji_msgs/msg/HandJointAngles` | Required | Always enabled |
-| `emf_poses` | `wuji_msgs/msg/TrackedPoseArray` | Optional | `publish_emf_poses` |
-| `tip_poses` | `wuji_msgs/msg/TrackedPoseArray` | Optional | `publish_tip_poses` |
-| `hand_skeleton` | `wuji_msgs/msg/TrackedPoseArray` | Optional | `publish_skeleton` |
-| `imu/palm` | `sensor_msgs/msg/Imu` | Optional | `publish_imu` |
-| `tactile` | `wuji_msgs/msg/TactileGrid` | Optional | `publish_tactile` |
-| `tactile/residual` | `wuji_msgs/msg/TactileGrid` | Optional | `publish_tactile_residual` |
-| `tactile/binary` | `wuji_msgs/msg/TactileGrid` | Optional | `publish_tactile_binary` |
-| `tactile/zones` | `wuji_msgs/msg/TactileZoneArray` | Optional | `publish_tactile_zones` |
-| `tactile/points` | `sensor_msgs/msg/PointCloud2` | Optional | `publish_tactile_points` |
-
-The driver maps the SDK `imu_raw/palm` resource to `imu/palm`. It doesn't publish the SDK-derived `imu_data/palm` resource.
-
-The wrapper converts without deriving new values. It preserves SDK IMU fields, complete skeleton and tactile arrays, and self-described point-cloud fields. `HandJointAngles` preserves each finger's valid angle count and confidence.
-
-## Fault and Shutdown Behavior
-
-The required `joint_angles` stream must start successfully. If it ends or reports an error while running, the node exits with a nonzero status. An optional stream that can't start or later ends is stopped and reported without terminating the other streams.
-
-The driver doesn't reconnect in process. On shutdown it closes every subscription in reverse order, disconnects the device, and releases the SDK runtime. Callback code doesn't close its own subscription.
-
-## Status Demo
-
-Start `glove.launch.py`, then run the read-only status Demo with the same namespace:
+The Wuji Glove status Demo is read-only. It prints every received joint-angle frame, then reports frame counts and average receive rates:
 
 ```bash
 ros2 run wuji_bringup glove_status_demo --ros-args \
   -r __ns:=/<namespace>
 ```
 
-The Demo prints the five fingers' angles and confidence for every `joint_angles` frame. After 10 seconds, it prints each topic's frame count and ROS receive rate. The rate uses the interval from the first callback through the last callback, so it excludes discovery and first-frame wait time. It succeeds when at least one `joint_angles` frame arrives. Missing optional streams produce warnings.
+## Packages
 
-Use `--duration <seconds>` before `--ros-args` to change the observation time.
+| Package | Purpose |
+|---------|---------|
+| [`wuji_glove_driver`](wuji_glove_driver/README.md) | Publishes Wuji Glove joint, pose, IMU, tactile, and point-cloud data |
+| [`wuji_hand2_driver`](wuji_hand2_driver/README.md) | Publishes Wuji Hand 2 data and exposes command and configuration endpoints |
+| [`wuji_msgs`](wuji_msgs/README.md) | Defines pose, joint-angle, tactile, raw joint diagnostic, and control interfaces |
+| [`wuji_sdk_vendor`](wuji_sdk_vendor/README.md) | Installs the Wuji SDK C header, shared library, license, and CMake target |
+| [`wuji_tools`](wuji_tools/README.md) | Provides the `wuji_list` device scanner |
+| [`wuji_bringup`](wuji_bringup/README.md) | Starts Wuji Hand 2 or Wuji Glove drivers and installs status and wave Demos |
 
-Add `--rate-only` before `--ros-args` to suppress per-frame joint angle output while measuring receive rates. Receive rates describe frames processed by the Demo, not the device's source output rate.
-
-## Hardware Tests
-
-Glove hardware tests are read-only and disabled by default. Build with `BUILD_TESTING=ON`, select a device, and explicitly opt in:
-
-```bash
-WUJI_GLOVE_HARDWARE_TESTS=1 \
-WUJI_GLOVE_HARDWARE_SERIAL=<serial-number> \
-./scripts/run_hardware_tests.sh --glove-read-only
-```
-
-You can set `WUJI_GLOVE_HARDWARE_ENDPOINT` or `WUJI_GLOVE_HARDWARE_HAND_SIDE` instead. With no selector, the runner uses unique-device discovery. The check only scans, connects, validates identity, subscribes to enabled streams, and observes frames. It doesn't change device state.
+See the [Wuji Hand 2 driver interfaces](wuji_hand2_driver/README.md) and [Wuji Glove driver interfaces](wuji_glove_driver/README.md) for topics, parameters, lifecycle behavior, and hardware tests. See the [Wuji SDK reference](https://docs.wuji.tech/docs/wuji-hand/latest/sdk-reference/) for the underlying device API.
 
 ## Troubleshooting
 
-- If selection times out, run `ros2 run wuji_tools wuji_list` and set `serial_number`, `endpoint`, or `hand_side`.
-- If multiple devices match, set an explicit `serial_number`.
-- If the node exits during operation, inspect the process log for the first `joint_angles` fault.
-- If an optional topic stops, inspect the process log for that stream's terminal event.
+1. **The build can't find a description package**
+
+   Run `sudo rosdep init` if rosdep has never been set up on this machine. Then run `rosdep update`, `scripts/install_hand2_descriptions.sh`, and `rosdep install --from-paths . --ignore-src -r -y`, and rebuild.
+
+2. **The Wuji SDK download fails**
+
+   Check access to GitHub Releases. For an offline build, provide an extracted SDK with `-DWUJI_SDK_ROOT=<sdk-root>`.
+
+3. **The driver reports multiple matching devices**
+
+   Run `wuji_list` and set one explicit `serial_number`. You can also select by `endpoint` or `hand_side`.
+
+4. **The status Demo reports missing data**
+
+   Use the same namespace for the launch and Demo. For Wuji Hand 2, keep `publish_joint_diagnostics` and `publish_imu` enabled. For Wuji Glove, `joint_angles` is required and missing optional streams only produce warnings.
+
+5. **The wave Demo doesn't move the hand**
+
+   Start `hand2.launch.py` with `auto_enable:=true`, use the same namespace, and inspect the driver log for rejected commands or SDK errors.
+
+## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) for contribution requirements and the complete verification commands. Hardware-changing tests require the documented opt-ins and operator safety setup.
 
 ## Contact
 
