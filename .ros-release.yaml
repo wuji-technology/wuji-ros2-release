@@ -1,0 +1,9 @@
+ros_distros:
+  - name: lyrical
+    container_image: ros:lyrical
+
+repository_name: wuji_ros2
+source_repository: https://github.com/wuji-technology/wuji-ros2.git
+release_repository: https://github.com/wuji-technology/wuji-ros2-release.git
+rosdistro_fork_owner: wuji-technology
+release_tag: "v:{version}"
