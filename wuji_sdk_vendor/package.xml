@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>wuji_sdk_vendor</name>
+  <version>2026.10.26</version>
+  <description>Vendor package for the Wuji SDK C library.</description>
+  <maintainer email="support@wuji.tech">Wuji Technology</maintainer>
+  <license>MIT</license>
+  <url type="website">https://github.com/wuji-technology/wuji-ros2</url>
+  <url type="repository">https://github.com/wuji-technology/wuji-ros2</url>
+  <url type="bugtracker">https://github.com/wuji-technology/wuji-ros2/issues</url>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>libudev-dev</exec_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
