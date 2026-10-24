@@ -1,0 +1,202 @@
+# Purpose: release one public source tag to one ROS distribution with Bloom.
+# Entry: manual dispatch after the GitHub Release for the tag exists.
+# The verify job checks the tag and resolves the container without
+# credentials. The release job runs behind the ros-release environment,
+# creates a missing Bloom track, then runs bloom-release.
+#
+# Remote effects: pushes to wuji-ros2-release and opens a ros/rosdistro PR.
+
+name: Bloom Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing public source tag to release
+        required: true
+        type: string
+      ros_distro:
+        description: ROS distribution to release
+        required: true
+        default: lyrical
+        type: string
+      pull_request_only:
+        description: Retry only the rosdistro pull request after release data exists
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ros-bloom-release
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify source tag
+    runs-on: ubuntu-latest
+    outputs:
+      source_sha: ${{ steps.resolve.outputs.source_sha }}
+      container_image: ${{ steps.resolve.outputs.container_image }}
+      rosdistro_fork_owner: ${{ steps.resolve.outputs.rosdistro_fork_owner }}
+    steps:
+      - name: Checkout trusted release tooling
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: trusted
+          persist-credentials: false
+
+      - name: Checkout source tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify exact source tag
+        working-directory: source
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Release tag must match vX.Y.Z"; exit 1; }
+          [[ "$(git describe --tags --exact-match HEAD)" == "$RELEASE_TAG" ]] || { echo "::error::Checked out ref is not $RELEASE_TAG"; exit 1; }
+          git fetch origin main
+          git merge-base --is-ancestor HEAD origin/main || { echo "::error::Release tag is not reachable from main"; exit 1; }
+
+      - name: Resolve configured container
+        id: resolve
+        env:
+          ROS_DISTRO: ${{ inputs.ros_distro }}
+        run: |
+          python3 -m pip install --disable-pip-version-check --user PyYAML
+          matrix="$(python3 trusted/.github/scripts/check_bloom_release.py \
+            --config source/.ros-release.yaml --print-ros-distro-matrix)"
+          container_image="$(jq -r --arg distro "$ROS_DISTRO" \
+            '[.[] | select(.ros_distro == $distro)] | if length == 1 then .[0].container_image else empty end' \
+            <<< "$matrix")"
+          [[ -n "$container_image" ]] || { echo "::error::ROS distribution $ROS_DISTRO is not configured"; exit 1; }
+          owner="$(python3 trusted/.github/scripts/check_bloom_release.py \
+            --config source/.ros-release.yaml --print-rosdistro-fork-owner)"
+          echo "container_image=$container_image" >> "$GITHUB_OUTPUT"
+          echo "rosdistro_fork_owner=$owner" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$(git -C source rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  release:
+    name: Release to ROS 2 ${{ inputs.ros_distro }}
+    needs: verify
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ needs.verify.outputs.container_image }}
+    defaults:
+      run:
+        shell: bash
+    timeout-minutes: 60
+    environment: ros-release
+    env:
+      RELEASE_REPOSITORY: https://github.com/wuji-technology/wuji-ros2-release.git
+      RELEASE_TAG: ${{ inputs.tag }}
+      ROS_DISTRO: ${{ inputs.ros_distro }}
+    steps:
+      - name: Install release dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install --yes --no-install-recommends ca-certificates gh git jq python3-venv
+
+      - name: Checkout trusted release tooling
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: main
+          path: trusted
+          persist-credentials: false
+
+      - name: Checkout verified source commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.verify.outputs.source_sha }}
+          path: source
+          persist-credentials: false
+
+      - name: Install Bloom
+        run: |
+          python3 -m venv /opt/ros-release-venv
+          /opt/ros-release-venv/bin/python -m pip install --disable-pip-version-check PyYAML bloom==0.14.3 pexpect==4.9.0
+          echo "/opt/ros-release-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Update rosdep
+        run: rosdep update --rosdistro "$ROS_DISTRO"
+
+      - name: Configure GitHub credentials
+        env:
+          GH_TOKEN: ${{ secrets.BLOOM_GITHUB_TOKEN }}
+          BLOOM_GITHUB_TOKEN: ${{ secrets.BLOOM_GITHUB_TOKEN }}
+          ROSDISTRO_FORK_OWNER: ${{ needs.verify.outputs.rosdistro_fork_owner }}
+        run: |
+          user="$(gh api user --jq .login)"
+          id="$(gh api user --jq .id)"
+          git config --global user.name "$user"
+          git config --global user.email "${id}+${user}@users.noreply.github.com"
+          umask 077
+          gh auth setup-git
+          mkdir -p "$HOME/.config"
+          jq -n --arg github_user "$ROSDISTRO_FORK_OWNER" --arg oauth_token "$BLOOM_GITHUB_TOKEN" \
+            '{github_user: $github_user, oauth_token: $oauth_token}' > "$HOME/.config/bloom"
+
+      # An empty release repository gets one README commit on master so
+      # git-bloom-config has a clean branch to write tracks.yaml to.
+      - name: Prepare release repository
+        if: ${{ !inputs.pull_request_only }}
+        env:
+          GH_TOKEN: ${{ secrets.BLOOM_GITHUB_TOKEN }}
+        run: |
+          git clone "$RELEASE_REPOSITORY" release_repository
+          if [[ -z "$(git -C release_repository ls-remote --heads origin)" ]]; then
+            git -C release_repository switch --orphan master
+            printf '# wuji_ros2 Release Repository\n\nBloom release history for <https://github.com/wuji-technology/wuji-ros2>. Automation maintains this repository.\n' \
+              > release_repository/README.md
+            git -C release_repository add README.md
+            git -C release_repository commit -m "Initialize release repository"
+          fi
+          python3 trusted/.github/scripts/initialize_bloom_tracks.py \
+            --config source/.ros-release.yaml --release-root release_repository
+          python3 trusted/.github/scripts/check_bloom_release.py \
+            --config source/.ros-release.yaml --root source --release-root release_repository \
+            --tag "$RELEASE_TAG" --ros-distro "$ROS_DISTRO"
+          git -C release_repository push origin master
+
+      - name: Check pull request retry
+        if: ${{ inputs.pull_request_only }}
+        env:
+          GH_TOKEN: ${{ secrets.BLOOM_GITHUB_TOKEN }}
+        run: |
+          git clone "$RELEASE_REPOSITORY" release_repository
+          python3 trusted/.github/scripts/check_bloom_release.py \
+            --config source/.ros-release.yaml --root source --release-root release_repository \
+            --tag "$RELEASE_TAG" --ros-distro "$ROS_DISTRO" --pull-request-only
+
+      - name: Confirm the tag still points to the verified commit
+        env:
+          SOURCE_SHA: ${{ needs.verify.outputs.source_sha }}
+        run: |
+          refs="$(git ls-remote https://github.com/${{ github.repository }}.git "refs/tags/${RELEASE_TAG}*")"
+          # Annotated tags list the peeled commit as <tag>^{}; lightweight tags list the commit directly.
+          remote="$(awk -v t="refs/tags/${RELEASE_TAG}" '$2 == t"^{}" {p=$1} $2 == t {l=$1} END {print (p ? p : l)}' <<< "$refs")"
+          [[ "$remote" == "$SOURCE_SHA" ]] || { echo "::error::$RELEASE_TAG moved after verification"; exit 1; }
+
+      - name: Run Bloom release
+        env:
+          BLOOM_DONT_ASK_FOR_DOCS: "1"
+          BLOOM_DONT_ASK_FOR_MAINTENANCE_STATUS: "1"
+          BLOOM_DONT_ASK_FOR_SOURCE: "1"
+          GH_TOKEN: ${{ secrets.BLOOM_GITHUB_TOKEN }}
+          PULL_REQUEST_ONLY: ${{ inputs.pull_request_only }}
+          ROSDISTRO_INDEX_URL: https://raw.githubusercontent.com/ros/rosdistro/master/index-v4.yaml
+        run: |
+          args=(--rosdistro "$ROS_DISTRO" --track "$ROS_DISTRO" --non-interactive)
+          [[ "$PULL_REQUEST_ONLY" == "true" ]] && args+=(--pull-request-only)
+          bloom-release "${args[@]}" --override-release-repository-url "$RELEASE_REPOSITORY" wuji_ros2
